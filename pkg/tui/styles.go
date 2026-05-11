@@ -18,4 +18,5 @@ var (
 
 	spinnerLabelStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#A5B4FC"))
+	errorStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444"))
 )

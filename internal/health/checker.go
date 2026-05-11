@@ -1,10 +1,15 @@
 package health
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
 	"sync"
+	"time"
+
+	"github.com/charmbracelet/lipgloss"
+	"github.com/dhanushnehru/domain-doctor/internal/resolver"
 )
 
 // DomainHealth contains the results of the health checks
@@ -18,8 +23,26 @@ type DomainHealth struct {
 	Warnings    []string
 }
 
+func SetResolver(dnsServer string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			d := net.Dialer{
+				Timeout: 5 * time.Second,
+			}
+
+			conn, err := d.DialContext(ctx, network, dnsServer)
+			if err != nil {
+				return nil, fmt.Errorf("dns dial failed: %w", err)
+			}
+
+			return conn, nil
+		},
+	}
+}
+
 // Check performs DNS-based health checks on a domain
-func Check(domain string) *DomainHealth {
+func Check(domain string, r resolver.NetResolver) *DomainHealth {
 	health := &DomainHealth{
 		Domain: domain,
 	}
@@ -30,7 +53,7 @@ func Check(domain string) *DomainHealth {
 	// Check A/AAAA records (Liveness)
 	go func() {
 		defer wg.Done()
-		ips, err := net.LookupHost(domain)
+		ips, err := r.LookupHost(context.Background(), domain)
 		if err == nil && len(ips) > 0 {
 			health.HasARecord = true
 		} else {
@@ -41,7 +64,7 @@ func Check(domain string) *DomainHealth {
 	// Check MX records
 	go func() {
 		defer wg.Done()
-		mxs, err := net.LookupMX(domain)
+		mxs, err := r.LookupMX(context.Background(), domain)
 		if err == nil && len(mxs) > 0 {
 			health.HasMXRecord = true
 		} else {
@@ -52,7 +75,7 @@ func Check(domain string) *DomainHealth {
 	// Check TXT records for SPF and DMARC
 	go func() {
 		defer wg.Done()
-		txts, err := net.LookupTXT(domain)
+		txts, err := r.LookupTXT(context.Background(), domain)
 		if err == nil {
 			for _, txt := range txts {
 				if strings.HasPrefix(txt, "v=spf1") {
@@ -68,7 +91,7 @@ func Check(domain string) *DomainHealth {
 
 		// Check DMARC (on _dmarc.domain)
 		dmarcDomain := "_dmarc." + domain
-		dmarcTxts, err := net.LookupTXT(dmarcDomain)
+		dmarcTxts, err := r.LookupTXT(context.Background(), dmarcDomain)
 		if err == nil {
 			for _, txt := range dmarcTxts {
 				if strings.HasPrefix(txt, "v=DMARC1") {
@@ -93,18 +116,18 @@ func Check(domain string) *DomainHealth {
 }
 
 func (h *DomainHealth) RenderReport(showHint bool) string {
-	var b strings.Builder
+	header := lipgloss.JoinVertical(
+		lipgloss.Left,
+		lipgloss.JoinHorizontal(lipgloss.Left, checkLabel.Render("Domain:"), domainStyle.Render(h.Domain)),
+	)
 
-	title := headerTitleStyle.Render("🩺 Domain Health Report")
-	domain := domainStyle.Render(h.Domain)
-	b.WriteString(headerCardStyle.Render(title+"\n"+domain) + "\n\n")
-
-	b.WriteString(renderStatus("Live (A/AAAA)", h.HasARecord) + "\n")
-	b.WriteString(renderStatus("Email Receiver (MX)", h.HasMXRecord) + "\n")
-	b.WriteString(renderStatus("Sender Policy (SPF)", h.HasSPF) + "\n")
-	b.WriteString(renderStatus("Domain Auth (DMARC)", h.HasDMARC) + "\n")
-
-	b.WriteString("\n" + dividerStyle.Render(strings.Repeat("─", 50)) + "\n")
+	status := lipgloss.JoinVertical(
+		lipgloss.Left,
+		renderStatus("Live (A/AAAA)", h.HasARecord),
+		renderStatus("Email Receiver (MX)", h.HasMXRecord),
+		renderStatus("Sender Policy (SPF)", h.HasSPF),
+		renderStatus("Domain Auth (DMARC)", h.HasDMARC),
+	)
 
 	passed := 0
 	for _, c := range []bool{h.HasARecord, h.HasMXRecord, h.HasSPF, h.HasDMARC} {
@@ -112,30 +135,59 @@ func (h *DomainHealth) RenderReport(showHint bool) string {
 			passed++
 		}
 	}
-	b.WriteString(renderScoreBar(passed, 4) + "\n")
+
+	score := renderScoreBar(passed, 4)
+
+	sections := []string{
+		header,
+		status,
+		dividerStyle.Render(strings.Repeat("─", 50)),
+		score,
+	}
 
 	if len(h.Warnings) > 0 {
-		b.WriteString("\n  " + warnTitleStyle.Render("⚠  Warnings") + "\n")
+		warnList := []string{warnTitleStyle.Render("⚠  Warnings")}
 		for _, w := range h.Warnings {
-			b.WriteString("    " + warnBullet.Render("·") + " " + w + "\n")
+			row := lipgloss.JoinHorizontal(
+				lipgloss.Left,
+				warnBullet.Render("."),
+				w,
+			)
+			warnList = append(warnList, row)
 		}
+		sections = append(sections, lipgloss.JoinVertical(lipgloss.Left, warnList...))
 	}
 
 	if len(h.Issues) > 0 {
-		b.WriteString("\n  " + critTitleStyle.Render("✖  Critical Issues") + "\n")
-		for _, issue := range h.Issues {
-			b.WriteString("    " + critBullet.Render("·") + " " + issue + "\n")
+		issueList := []string{critTitleStyle.Render("✖  Critical Issues")}
+		for _, i := range h.Issues {
+			row := lipgloss.JoinHorizontal(
+				lipgloss.Left,
+				critBullet.Render("."),
+				i,
+			)
+			issueList = append(issueList, row)
 		}
+		sections = append(sections, lipgloss.JoinVertical(lipgloss.Left, issueList...))
 	}
 
 	if len(h.Issues) == 0 && len(h.Warnings) == 0 {
-		b.WriteString("\n  " + okStyle.Render("✅  All checks passed. Your domain is healthy!") + "\n")
+		sections = append(
+			sections,
+			okStyle.Render("✅  All checks passed. Your domain is healthy!"),
+		)
 	}
 
 	if showHint {
-		b.WriteString("\n  " + hintStyle.Render("Press Enter or Esc to exit") + "\n")
+		sections = append(sections,
+			hintStyle.Render("Press Enter or Esc to exit"),
+		)
 	}
-	return b.String()
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		sections...,
+	)
 }
 
 func renderStatus(name string, passed bool) string {
@@ -145,13 +197,20 @@ func renderStatus(name string, passed bool) string {
 	} else {
 		badge = failBadge.Render("✗ FAIL")
 	}
-	return "  " + badge + " " + checkLabel.Render(name)
+
+	return lipgloss.JoinVertical(
+		lipgloss.Left,
+		badge,
+		checkLabel.Render(name),
+	)
 }
 
 func renderScoreBar(passed, total int) string {
-	filled := strings.Repeat("█", passed)
-	empty := strings.Repeat("░", total-passed)
-	bar := scoreBarFill.Render(filled) + scoreBarEmpty.Render(empty)
-	label := fmt.Sprintf(" %d/%d checks passed", passed, total)
-	return "  " + bar + scoreBarLabel.Render(label)
+	filled := scoreBarFill.Render(strings.Repeat("█", passed))
+	empty := scoreBarEmpty.Render(strings.Repeat("░", total-passed))
+
+	bar := lipgloss.JoinHorizontal(lipgloss.Left, filled, empty)
+	label := scoreBarLabel.Render(fmt.Sprintf(" %d/%d checks passed", passed, total))
+
+	return lipgloss.JoinHorizontal(lipgloss.Left, bar, label)
 }

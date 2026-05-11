@@ -32,6 +32,9 @@ var (
 				Bold(true).
 				Foreground(colorTitle)
 
+	headerSubTitleStyle = lipgloss.NewStyle().
+				Foreground(colorMuted)
+
 	domainStyle = lipgloss.NewStyle().
 			Bold(true).
 			Foreground(colorWhite)
